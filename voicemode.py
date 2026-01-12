@@ -20,6 +20,15 @@ FORMAT = pyaudio.paInt16
 # WebSocket URL
 REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
 
+# Exit phrases (lowercase for matching)
+EXIT_PHRASES = [
+    "ok bye bye", "okay bye bye", "bye bye",
+    "shut down", "shutdown",
+    "exit", "quit", "stop",
+    "goodbye", "good bye",
+    "end session", "close session"
+]
+
 
 class VoiceMode:
     def __init__(self, markdown_path: str, voice: str = "alloy",
@@ -210,6 +219,13 @@ Keep responses concise for voice - aim for 1-3 sentences unless they ask for mor
                     text = event.get("transcript", "")
                     if text:
                         print(f"\033[92mYou: {text}\033[0m")
+                        # Check for exit phrases
+                        text_lower = text.lower().strip()
+                        for phrase in EXIT_PHRASES:
+                            if phrase in text_lower:
+                                print("\n\033[93mGoodbye! Ending session...\033[0m")
+                                self.running = False
+                                return
 
                 elif event_type == "error":
                     error = event.get("error", {})
