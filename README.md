@@ -14,6 +14,22 @@ Requires Python 3.9+ and an OpenAI API key with access to `gpt-4o-realtime-previ
 export OPENAI_API_KEY="your-key-here"
 ```
 
+### Use from anywhere
+
+Add an alias to your shell config (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+alias voicemode="python3.11 /path/to/VoiceMode/voicemode.py"
+```
+
+Then reload: `source ~/.zshrc`
+
+Now run from any folder:
+
+```bash
+voicemode ~/Notes/my-note.md
+```
+
 ## Usage
 
 ```bash
