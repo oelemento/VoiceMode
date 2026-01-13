@@ -15,9 +15,7 @@ import websockets
 SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_SIZE = 2400  # 100ms at 24kHz
-OUTPUT_BUFFER_SIZE = 4800  # 200ms output buffer for smoother playback
 FORMAT = pyaudio.paInt16
-PREBUFFER_CHUNKS = 3  # Buffer 3 chunks (~300ms) before starting playback
 
 # WebSocket URL
 REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
@@ -128,7 +126,7 @@ Keep responses concise for voice - aim for 1-3 sentences unless they ask for mor
             "channels": CHANNELS,
             "rate": SAMPLE_RATE,
             "output": True,
-            "frames_per_buffer": OUTPUT_BUFFER_SIZE
+            "frames_per_buffer": CHUNK_SIZE
         }
         if self.output_device is not None:
             output_kwargs["output_device_index"] = self.output_device
@@ -161,10 +159,8 @@ Keep responses concise for voice - aim for 1-3 sentences unless they ask for mor
                 break
 
     async def play_audio(self):
-        """Play audio chunks from the buffer with pre-buffering for smoothness."""
+        """Play audio chunks from the buffer."""
         loop = asyncio.get_event_loop()
-        prebuffer = []
-        buffering = True
 
         while self.running:
             try:
@@ -173,45 +169,14 @@ Keep responses concise for voice - aim for 1-3 sentences unless they ask for mor
                     timeout=0.1
                 )
 
-                if buffering:
-                    # Accumulate chunks before starting playback
-                    prebuffer.append(audio_data)
-                    if len(prebuffer) >= PREBUFFER_CHUNKS:
-                        # Play all buffered audio
-                        self.is_playing = True
-                        combined = b''.join(prebuffer)
-                        await loop.run_in_executor(
-                            None,
-                            lambda c=combined: self.output_stream.write(c)
-                        )
-                        prebuffer = []
-                        buffering = False
-                else:
-                    # Normal playback - batch a couple chunks if available
-                    chunks = [audio_data]
-                    while not self.audio_buffer.empty() and len(chunks) < 2:
-                        try:
-                            chunks.append(self.audio_buffer.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
-                    combined = b''.join(chunks)
-                    await loop.run_in_executor(
-                        None,
-                        lambda c=combined: self.output_stream.write(c)
-                    )
+                self.is_playing = True
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.output_stream.write(audio_data)
+                )
+                self.is_playing = False
 
             except asyncio.TimeoutError:
-                # Flush any remaining prebuffer on timeout
-                if prebuffer:
-                    self.is_playing = True
-                    combined = b''.join(prebuffer)
-                    await loop.run_in_executor(
-                        None,
-                        lambda c=combined: self.output_stream.write(c)
-                    )
-                    prebuffer = []
-                buffering = True  # Reset for next response
-                self.is_playing = False
                 continue
             except Exception as e:
                 if self.running:
