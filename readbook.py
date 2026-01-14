@@ -7,6 +7,9 @@ import json
 import os
 import re
 import sys
+import select
+import termios
+import tty
 from pathlib import Path
 
 import ebooklib
@@ -89,6 +92,8 @@ class BookReader:
         self.waiting_for_response = False
         self.audio_buffer = asyncio.Queue()
         self.pending_text = ""  # Text waiting to be read
+        self.is_playing = False  # Echo suppression flag
+        self.old_settings = None  # Terminal settings for keyboard input
 
     def get_context_window(self) -> str:
         """Get recent text for context (last ~2000 chars)."""
@@ -191,7 +196,7 @@ Instructions:
 
         output_kwargs = {
             "format": FORMAT,
-            "channels": CHANNELS,
+            "channels": CHANNELS,  # Mono
             "rate": SAMPLE_RATE,
             "output": True,
             "frames_per_buffer": CHUNK_SIZE
@@ -218,13 +223,62 @@ Instructions:
         await self.ws.send(json.dumps({"type": "response.create"}))
         self.waiting_for_response = True
 
+    async def keyboard_listener(self):
+        """Listen for keyboard input (spacebar to pause/resume)."""
+        loop = asyncio.get_event_loop()
+
+        # Set terminal to raw mode for single key detection
+        self.old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+        try:
+            while self.running:
+                # Check if input is available
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    key = await loop.run_in_executor(None, sys.stdin.read, 1)
+
+                    if key == ' ':  # Spacebar
+                        if self.reading:
+                            print("\n\033[93m[PAUSED - Press SPACE to resume, or speak your question]\033[0m")
+                            self.reading = False
+                            # Clear audio buffer
+                            while not self.audio_buffer.empty():
+                                try:
+                                    self.audio_buffer.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                            # Cancel current response
+                            await self.ws.send(json.dumps({"type": "response.cancel"}))
+                            self.is_playing = False  # Re-enable mic
+                        else:
+                            print("\033[93m[RESUMING...]\033[0m")
+                            self.reading = True
+                            # Update context and continue
+                            await self.ws.send(json.dumps({
+                                "type": "session.update",
+                                "session": {"instructions": self.build_system_prompt()}
+                            }))
+                            chunk = self.get_next_chunk()
+                            if chunk:
+                                await self.send_text_to_read(chunk)
+
+                    elif key == 'q':  # Q to quit
+                        print("\n\033[93mQuitting...\033[0m")
+                        self.running = False
+                        break
+                else:
+                    await asyncio.sleep(0.1)
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
     async def reading_loop(self):
         """Manage the reading flow."""
         # Start with first chunk
         await asyncio.sleep(1)  # Let connection settle
 
-        print("\n\033[93mStarting to read. Interrupt anytime to ask questions.\033[0m")
-        print("\033[93mSay 'continue' to resume reading after questions.\033[0m\n")
+        print("\n\033[93mStarting to read. Press SPACE to pause and ask questions.\033[0m")
+        print("\033[93mPress Q to quit.\033[0m\n")
 
         self.reading = True
         chunk = self.get_next_chunk()
@@ -242,16 +296,28 @@ Instructions:
                     lambda: self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 )
 
-                audio_b64 = base64.b64encode(audio_data).decode("utf-8")
-                await self.ws.send(json.dumps({
-                    "type": "input_audio_buffer.append",
-                    "audio": audio_b64
-                }))
+                # Echo suppression: don't send mic audio while playing
+                if not self.is_playing:
+                    audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+                    await self.ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_b64
+                    }))
 
             except Exception as e:
                 if self.running:
                     print(f"Audio capture error: {e}")
                 break
+
+    def mono_to_stereo(self, mono_data: bytes) -> bytes:
+        """Convert mono audio to stereo by duplicating channels."""
+        import array
+        mono = array.array('h', mono_data)
+        stereo = array.array('h')
+        for sample in mono:
+            stereo.append(sample)  # Left
+            stereo.append(sample)  # Right
+        return stereo.tobytes()
 
     async def play_audio(self):
         """Play audio chunks from the buffer."""
@@ -264,14 +330,17 @@ Instructions:
                     timeout=0.1
                 )
 
+                self.is_playing = True
                 await loop.run_in_executor(
                     None,
-                    lambda: self.output_stream.write(audio_data)
+                    lambda d=audio_data: self.output_stream.write(d)
                 )
 
             except asyncio.TimeoutError:
+                self.is_playing = False
                 continue
             except Exception as e:
+                self.is_playing = False
                 if self.running:
                     print(f"Audio playback error: {e}")
                 break
@@ -299,15 +368,21 @@ Instructions:
 
                 elif event_type == "response.done":
                     self.waiting_for_response = False
-                    # If we're in reading mode, continue with next chunk
+                    # If we're in reading mode, wait for audio to finish then continue
                     if self.reading:
-                        await asyncio.sleep(0.3)  # Brief pause between chunks
-                        chunk = self.get_next_chunk()
-                        if chunk:
-                            await self.send_text_to_read(chunk)
-                        else:
-                            print("\n\033[93mFinished reading the book!\033[0m")
-                            self.reading = False
+                        # Wait for audio buffer to drain
+                        while not self.audio_buffer.empty():
+                            await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.5)  # Brief pause between chunks
+
+                        # Check we're still in reading mode (user might have interrupted)
+                        if self.reading:
+                            chunk = self.get_next_chunk()
+                            if chunk:
+                                await self.send_text_to_read(chunk)
+                            else:
+                                print("\n\033[93mFinished reading the book!\033[0m")
+                                self.reading = False
 
                 elif event_type == "input_audio_buffer.speech_started":
                     # User interrupted - clear audio buffer
@@ -373,7 +448,8 @@ Instructions:
                 self.reading_loop(),
                 self.capture_audio(),
                 self.play_audio(),
-                self.handle_events()
+                self.handle_events(),
+                self.keyboard_listener()
             )
 
         except KeyboardInterrupt:
@@ -384,6 +460,12 @@ Instructions:
 
     async def cleanup(self):
         """Clean up resources."""
+        # Restore terminal settings
+        if self.old_settings:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+            except:
+                pass
         if self.input_stream:
             self.input_stream.stop_stream()
             self.input_stream.close()
@@ -417,9 +499,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Read epub books aloud with voice Q&A")
     parser.add_argument("epub_file", nargs="?", help="Path to epub file")
-    parser.add_argument("--voice", "-v", default="onyx",
-                        choices=["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
-                        help="Voice to use (default: onyx)")
+    parser.add_argument("--voice", "-v", default="ash",
+                        choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
+                        help="Voice to use (default: ash)")
     parser.add_argument("--input", "-i", type=int, help="Input device index")
     parser.add_argument("--output", "-o", type=int, help="Output device index")
     parser.add_argument("--list-devices", "-l", action="store_true",
