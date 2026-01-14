@@ -1,2 +1,4 @@
 websockets>=12.0
 pyaudio>=0.2.14
+ebooklib>=0.18
+beautifulsoup4>=4.12

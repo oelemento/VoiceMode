@@ -89,3 +89,52 @@ Say any of these to exit:
 ## Transcripts
 
 Session transcripts are saved to the `transcripts/` folder.
+
+---
+
+# ReadBook
+
+Read epub books aloud with voice Q&A - interrupt anytime to ask questions.
+
+## Usage
+
+```bash
+python readbook.py <epub_file> [options]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--voice`, `-v` | Voice: alloy, echo, fable, onyx, nova, shimmer (default: onyx) |
+| `--input`, `-i` | Input device index (microphone) |
+| `--output`, `-o` | Output device index (speakers/headphones) |
+| `--chapter`, `-c` | Start from chapter number (0-indexed) |
+| `--list-devices`, `-l` | List available audio devices |
+
+### Examples
+
+```bash
+# Read a book
+python readbook.py "My Book.epub"
+
+# Start from chapter 3
+python readbook.py book.epub --chapter 3
+
+# Use specific voice
+python readbook.py book.epub --voice nova
+```
+
+### Voice Commands
+
+While reading:
+- **Interrupt anytime** - Just speak to pause and ask a question
+- **"Continue"** / **"Keep reading"** - Resume reading
+- **"Stop reading"** / **"Exit"** - End session
+
+### Example Questions
+
+- "Who is this character?"
+- "What did he mean by that?"
+- "Summarize what just happened"
+- "Why is this important?"
