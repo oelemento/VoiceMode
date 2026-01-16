@@ -405,8 +405,9 @@ Instructions:
                     lambda: self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 )
 
-                # Echo suppression: don't send mic audio while playing or paused
-                if not self.is_playing and not self.paused:
+                # Only capture mic when paused for Q&A (not while reading)
+                # This disables voice interruption - use SPACE to pause instead
+                if not self.is_playing and not self.paused and not self.reading:
                     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
                     await self.ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
