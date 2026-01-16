@@ -127,6 +127,7 @@ class BookReader:
         self.is_playing = False  # Echo suppression flag
         self.old_settings = None  # Terminal settings for keyboard input
         self.current_transcript = ""  # Accumulate AI response for navigation parsing
+        self.paused = False  # User paused - don't capture mic
 
     def get_context_window(self) -> str:
         """Get recent text for context (last ~2000 chars)."""
@@ -335,21 +336,35 @@ Instructions:
                     key = await loop.run_in_executor(None, sys.stdin.read, 1)
 
                     if key == ' ':  # Spacebar
-                        if self.reading:
+                        if self.reading and not self.paused:
                             print("\n\033[93m[PAUSED - Press SPACE to resume, or speak your question]\033[0m")
                             self.reading = False
-                            # Clear audio buffer
+                            self.paused = True
+                            # Clear output audio buffer
                             while not self.audio_buffer.empty():
                                 try:
                                     self.audio_buffer.get_nowait()
                                 except asyncio.QueueEmpty:
                                     break
-                            # Cancel current response
+                            # Cancel current response and clear server-side input buffer
                             await self.ws.send(json.dumps({"type": "response.cancel"}))
-                            self.is_playing = False  # Re-enable mic
+                            await self.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            self.is_playing = False
+                            self.waiting_for_response = False
+                            # Wait for echoes to die down, then clear again
+                            await asyncio.sleep(0.5)
+                            await self.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            self.paused = False  # Now allow mic input for questions
+                        elif self.paused:
+                            # Still settling, ignore
+                            pass
                         else:
                             print("\033[93m[RESUMING...]\033[0m")
                             self.reading = True
+                            # Clear any stray audio that accumulated while paused
+                            await self.ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                            # Wait briefly for any active response to finish
+                            await asyncio.sleep(0.2)
                             # Only get next chunk if not already waiting
                             if not self.waiting_for_response:
                                 chunk = self.get_next_chunk()
@@ -390,8 +405,8 @@ Instructions:
                     lambda: self.input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 )
 
-                # Echo suppression: don't send mic audio while playing
-                if not self.is_playing:
+                # Echo suppression: don't send mic audio while playing or paused
+                if not self.is_playing and not self.paused:
                     audio_b64 = base64.b64encode(audio_data).decode("utf-8")
                     await self.ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
@@ -498,8 +513,9 @@ Instructions:
                                 self.reading = False
 
                 elif event_type == "input_audio_buffer.speech_started":
-                    # User interrupted - clear audio buffer
+                    # User interrupted (or stray audio detected)
                     self.reading = False  # Pause reading mode
+                    self.waiting_for_response = True  # VAD will trigger a response
                     while not self.audio_buffer.empty():
                         try:
                             self.audio_buffer.get_nowait()
