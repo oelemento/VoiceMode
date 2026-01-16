@@ -31,6 +31,34 @@ REALTIME_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
 EXIT_PHRASES = ["bye bye", "stop reading", "exit", "quit", "shut down", "goodbye"]
 RESUME_PHRASES = ["continue", "keep reading", "resume", "go on", "keep going"]
 
+# Navigation command pattern (AI outputs this to navigate)
+NAVIGATE_PATTERN = re.compile(r'\[NAVIGATE:\s*(.+?)\]', re.IGNORECASE)
+
+
+def clean_text(text: str) -> str:
+    """Clean extracted text from common EPUB artifacts."""
+    # Remove page numbers (standalone numbers or "Page X")
+    text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
+    text = re.sub(r'\nPage\s+\d+\n', '\n', text, flags=re.IGNORECASE)
+
+    # Remove sequences of numbers (like 1 2 3 4 5... from TOC or index)
+    text = re.sub(r'(\d+\s+){5,}', '', text)
+
+    # Remove footnote markers like [1], [2], etc.
+    text = re.sub(r'\[\d+\]', '', text)
+
+    # Remove standalone numbers on lines (page numbers)
+    text = re.sub(r'^\d+$', '', text, flags=re.MULTILINE)
+
+    # Clean up excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+
+    # Remove common header/footer artifacts
+    text = re.sub(r'\n(Contents|Table of Contents|Index)\n', '\n', text, flags=re.IGNORECASE)
+
+    return text.strip()
+
 
 def extract_text_from_epub(epub_path: str) -> list[dict]:
     """Extract chapters from epub file."""
@@ -41,6 +69,10 @@ def extract_text_from_epub(epub_path: str) -> list[dict]:
         if item.get_type() == ebooklib.ITEM_DOCUMENT:
             soup = BeautifulSoup(item.get_content(), 'html.parser')
 
+            # Remove script, style, and nav elements
+            for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+                tag.decompose()
+
             # Get title if available
             title = None
             title_tag = soup.find(['h1', 'h2', 'title'])
@@ -49,7 +81,7 @@ def extract_text_from_epub(epub_path: str) -> list[dict]:
 
             # Get text content
             text = soup.get_text(separator='\n', strip=True)
-            text = re.sub(r'\n{3,}', '\n\n', text)  # Clean up excessive newlines
+            text = clean_text(text)
 
             if text and len(text) > 100:  # Skip very short sections
                 chapters.append({
@@ -94,6 +126,7 @@ class BookReader:
         self.pending_text = ""  # Text waiting to be read
         self.is_playing = False  # Echo suppression flag
         self.old_settings = None  # Terminal settings for keyboard input
+        self.current_transcript = ""  # Accumulate AI response for navigation parsing
 
     def get_context_window(self) -> str:
         """Get recent text for context (last ~2000 chars)."""
@@ -106,6 +139,58 @@ class BookReader:
 
         context = chapter['text'][start:end]
         return f"[Chapter: {chapter['title']}]\n\n{context}"
+
+    def get_chapter_list(self) -> str:
+        """Get formatted list of chapters for the AI."""
+        lines = []
+        for i, ch in enumerate(self.chapters):
+            marker = " <-- CURRENT" if i == self.current_chapter else ""
+            lines.append(f"  {i}: {ch['title']}{marker}")
+        return "\n".join(lines)
+
+    def go_to_chapter(self, target: str) -> tuple[bool, str]:
+        """Navigate to a chapter by number or name. Returns (success, message)."""
+        target = target.strip()
+
+        # Try as number first
+        try:
+            chapter_num = int(target)
+            if 0 <= chapter_num < len(self.chapters):
+                self.current_chapter = chapter_num
+                self.current_position = 0
+                return True, f"Navigated to chapter {chapter_num}: {self.chapters[chapter_num]['title']}"
+            else:
+                return False, f"Chapter {chapter_num} not found. Valid range: 0-{len(self.chapters)-1}"
+        except ValueError:
+            pass
+
+        # Try as name (fuzzy match)
+        target_lower = target.lower()
+        for i, ch in enumerate(self.chapters):
+            title_lower = ch['title'].lower()
+            # Exact match or contains
+            if target_lower == title_lower or target_lower in title_lower:
+                self.current_chapter = i
+                self.current_position = 0
+                return True, f"Navigated to chapter {i}: {ch['title']}"
+
+        # Try word matching
+        target_words = set(target_lower.split())
+        best_match = -1
+        best_score = 0
+        for i, ch in enumerate(self.chapters):
+            title_words = set(ch['title'].lower().split())
+            score = len(target_words & title_words)
+            if score > best_score:
+                best_score = score
+                best_match = i
+
+        if best_match >= 0 and best_score > 0:
+            self.current_chapter = best_match
+            self.current_position = 0
+            return True, f"Navigated to chapter {best_match}: {self.chapters[best_match]['title']}"
+
+        return False, f"Could not find chapter matching '{target}'"
 
     def get_next_chunk(self) -> str | None:
         """Get next chunk of text to read."""
@@ -121,7 +206,9 @@ class BookReader:
             if self.current_chapter >= len(self.chapters):
                 return None
             chapter = self.chapters[self.current_chapter]
-            return f"\n\nChapter: {chapter['title']}\n\n" + chapter['text'][:self.chunk_size]
+            chunk = chapter['text'][:self.chunk_size]
+            self.current_position = len(chunk)  # Fix: update position
+            return f"\n\nChapter: {chapter['title']}\n\n" + chunk
 
         chunk = chapter['text'][self.current_position:self.current_position + self.chunk_size]
         self.current_position += len(chunk)
@@ -130,10 +217,19 @@ class BookReader:
     def build_system_prompt(self) -> str:
         return f"""You are reading the book "{self.epub_path.stem}" aloud to the user.
 
+AVAILABLE CHAPTERS:
+{self.get_chapter_list()}
+
 Your modes:
 1. READING MODE: When told to read, speak the text naturally as an audiobook narrator. Read exactly what's given - don't summarize or paraphrase.
 
 2. Q&A MODE: When the user interrupts with a question, answer based on the book content you've read so far. Be helpful and concise.
+
+3. NAVIGATION MODE: When the user asks to go to a specific chapter, skip ahead, go back, or navigate anywhere in the book:
+   - First, say something brief like "Okay, going to chapter X" or "Jumping to the introduction"
+   - Then output the navigation command EXACTLY like this: [NAVIGATE: chapter_name_or_number]
+   - Examples: [NAVIGATE: 3] or [NAVIGATE: Introduction] or [NAVIGATE: Chapter One]
+   - The system will handle the navigation and start reading from that chapter.
 
 Current position context:
 {self.get_context_window()}
@@ -142,6 +238,7 @@ Instructions:
 - Read the text naturally with good pacing
 - When user asks a question, answer it helpfully based on the book
 - If user says "continue" or "keep reading", resume reading from where you left off
+- If user asks to go to a chapter (e.g., "go to chapter 5", "skip to the introduction", "jump to part two"), use [NAVIGATE: target]
 - Keep Q&A answers brief (1-3 sentences) unless user asks for more detail"""
 
     async def connect(self):
@@ -253,14 +350,11 @@ Instructions:
                         else:
                             print("\033[93m[RESUMING...]\033[0m")
                             self.reading = True
-                            # Update context and continue
-                            await self.ws.send(json.dumps({
-                                "type": "session.update",
-                                "session": {"instructions": self.build_system_prompt()}
-                            }))
-                            chunk = self.get_next_chunk()
-                            if chunk:
-                                await self.send_text_to_read(chunk)
+                            # Only get next chunk if not already waiting
+                            if not self.waiting_for_response:
+                                chunk = self.get_next_chunk()
+                                if chunk:
+                                    await self.send_text_to_read(chunk)
 
                     elif key == 'q':  # Q to quit
                         print("\n\033[93mQuitting...\033[0m")
@@ -361,10 +455,29 @@ Instructions:
 
                 elif event_type == "response.audio_transcript.delta":
                     text = event.get("delta", "")
+                    self.current_transcript += text
                     print(f"\033[94m{text}\033[0m", end="", flush=True)
 
                 elif event_type == "response.audio_transcript.done":
                     print()
+                    # Check for navigation command in the transcript
+                    match = NAVIGATE_PATTERN.search(self.current_transcript)
+                    if match:
+                        target = match.group(1)
+                        print(f"\033[93m[Navigation requested: {target}]\033[0m")
+                        success, message = self.go_to_chapter(target)
+                        print(f"\033[93m{message}\033[0m")
+                        if success:
+                            # Update session with new context
+                            await self.ws.send(json.dumps({
+                                "type": "session.update",
+                                "session": {
+                                    "instructions": self.build_system_prompt()
+                                }
+                            }))
+                            # Set reading mode - response.done will send the first chunk
+                            self.reading = True
+                    self.current_transcript = ""  # Reset for next response
 
                 elif event_type == "response.done":
                     self.waiting_for_response = False
@@ -427,7 +540,10 @@ Instructions:
 
                 elif event_type == "error":
                     error = event.get("error", {})
-                    print(f"\033[91mError: {error.get('message', 'Unknown error')}\033[0m")
+                    msg = error.get('message', 'Unknown error')
+                    # Suppress harmless cancellation errors
+                    if "Cancellation failed" not in msg:
+                        print(f"\033[91mError: {msg}\033[0m")
 
             except websockets.exceptions.ConnectionClosed:
                 print("Connection closed")
