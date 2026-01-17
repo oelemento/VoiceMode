@@ -92,10 +92,187 @@ def extract_text_from_epub(epub_path: str) -> list[dict]:
     return chapters
 
 
+def clean_pdf_text(text: str) -> str:
+    """Clean PDF-extracted text from common artifacts."""
+    # Remove markdown image references
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    # Remove excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Remove horizontal rules
+    text = re.sub(r'^[-*_]{3,}$', '', text, flags=re.MULTILINE)
+    # Clean up table remnants (pipes)
+    text = re.sub(r'\|+', ' ', text)
+    return text.strip()
+
+
+def split_markdown_into_articles(md_text: str) -> list[dict]:
+    """Split markdown text into articles based on # headings."""
+    articles = []
+
+    # Try splitting on H1 headings first
+    h1_pattern = re.compile(r'^# (.+)$', re.MULTILINE)
+    h1_matches = list(h1_pattern.finditer(md_text))
+
+    if len(h1_matches) >= 2:
+        for i, match in enumerate(h1_matches):
+            title = match.group(1).strip()
+            start = match.end()
+            end = h1_matches[i + 1].start() if i + 1 < len(h1_matches) else len(md_text)
+            text = md_text[start:end].strip()
+            if text and len(text) > 100:
+                articles.append({'title': title, 'text': clean_pdf_text(text)})
+
+    # Fallback: try H2 headings
+    if not articles:
+        h2_pattern = re.compile(r'^## (.+)$', re.MULTILINE)
+        h2_matches = list(h2_pattern.finditer(md_text))
+        if len(h2_matches) >= 2:
+            for i, match in enumerate(h2_matches):
+                title = match.group(1).strip()
+                start = match.end()
+                end = h2_matches[i + 1].start() if i + 1 < len(h2_matches) else len(md_text)
+                text = md_text[start:end].strip()
+                if text and len(text) > 100:
+                    articles.append({'title': title, 'text': clean_pdf_text(text)})
+
+    # Final fallback: treat as single document
+    if not articles:
+        articles.append({
+            'title': 'Document',
+            'text': clean_pdf_text(md_text)
+        })
+
+    return articles
+
+
+def extract_text_from_pdf(pdf_path: str) -> list[dict]:
+    """Extract articles/sections from PDF file.
+
+    Handles multi-column layouts common in magazines.
+    Falls back to page-based extraction if markdown extraction fails.
+    """
+    import pymupdf
+
+    doc = pymupdf.open(pdf_path)
+
+    # Try pymupdf4llm first for better layout handling
+    try:
+        import pymupdf4llm
+        md_text = pymupdf4llm.to_markdown(doc, show_progress=False)
+        doc.close()
+        return split_markdown_into_articles(md_text)
+    except Exception:
+        pass  # Fall through to basic extraction
+
+    # Basic extraction: group pages into sections based on content
+    # For magazines, look for article titles (short capitalized lines followed by body text)
+    articles = []
+    current_article = {'title': None, 'text': [], 'start_page': 0}
+
+    # Skip words that indicate navigation/UI elements
+    skip_patterns = ['menu', 'share', 'save', 'insider', 'advertisement', 'photograph',
+                     'listen to', 'for you', 'weekly edition', '●', '0:00',
+                     'get the economist', 'ios or android', 'united states', 'china',
+                     'business', 'finance', 'europe', 'middle east', 'americas',
+                     'the world this week', 'min read', 'back to top', 'world in brief',
+                     'reuse this content', 'sign up', 'from the january', 'from the february',
+                     'from the march', 'from the april', 'from the may', 'from the june',
+                     'from the july', 'from the august', 'from the september', 'from the october',
+                     'from the november', 'from the december', 'politics', 'science']
+
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        text = page.get_text().strip()
+
+        if not text or len(text) < 100:
+            continue
+
+        lines = text.split('\n')
+        page_content = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Skip navigation/UI elements
+            if any(skip in line.lower() for skip in skip_patterns):
+                continue
+
+            # Detect potential article title:
+            # - Short line (5-80 chars)
+            # - Contains at least 2 words
+            # - Followed by longer content
+            is_potential_title = (
+                5 < len(line) < 80 and
+                len(line.split()) >= 2 and
+                not line.endswith('.') and  # Titles usually don't end with period
+                line[0].isupper()  # Starts with capital
+            )
+
+            if is_potential_title and len(page_content) == 0:
+                # This might be a new article title
+                # Save previous article if it has enough content
+                if current_article['title'] and len('\n'.join(current_article['text'])) > 500:
+                    articles.append({
+                        'title': f"{current_article['title']} (p.{current_article['start_page']+1})",
+                        'text': clean_pdf_text('\n'.join(current_article['text']))
+                    })
+                current_article = {'title': line, 'text': [], 'start_page': page_num}
+            else:
+                page_content.append(line)
+
+        if page_content:
+            current_article['text'].extend(page_content)
+
+    # Add last article
+    if current_article['title'] and len('\n'.join(current_article['text'])) > 500:
+        articles.append({
+            'title': f"{current_article['title']} (p.{current_article['start_page']+1})",
+            'text': clean_pdf_text('\n'.join(current_article['text']))
+        })
+
+    doc.close()
+
+    # Deduplicate articles with similar titles (keep longest content)
+    seen_titles = {}
+    for article in articles:
+        # Normalize title for comparison (remove page numbers)
+        base_title = re.sub(r'\s*\(p\.\d+\)$', '', article['title']).strip().lower()
+        if base_title in seen_titles:
+            # Keep the one with more content
+            if len(article['text']) > len(seen_titles[base_title]['text']):
+                seen_titles[base_title] = article
+        else:
+            seen_titles[base_title] = article
+    articles = list(seen_titles.values())
+
+    # If too few articles found, fall back to page-based chunking
+    if len(articles) < 3:
+        doc = pymupdf.open(pdf_path)
+        articles = []
+        # Group pages into chunks of ~5 pages
+        chunk_size = 5
+        for start_page in range(0, doc.page_count, chunk_size):
+            end_page = min(start_page + chunk_size, doc.page_count)
+            chunk_text = '\n'.join(doc[i].get_text() for i in range(start_page, end_page))
+            if len(chunk_text) > 200:
+                # Try to find a title from first few lines
+                first_lines = [l.strip() for l in chunk_text.split('\n')[:10] if l.strip()]
+                title = next((l for l in first_lines if 10 < len(l) < 80), f"Pages {start_page+1}-{end_page}")
+                articles.append({
+                    'title': title,
+                    'text': clean_pdf_text(chunk_text)
+                })
+        doc.close()
+
+    return articles
+
+
 class BookReader:
-    def __init__(self, epub_path: str, voice: str = "onyx",
+    def __init__(self, file_path: str, voice: str = "onyx",
                  input_device: int = None, output_device: int = None):
-        self.epub_path = Path(epub_path)
+        self.file_path = Path(file_path)
         self.voice = voice
         self.input_device = input_device
         self.output_device = output_device
@@ -103,10 +280,16 @@ class BookReader:
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
 
-        # Load book
-        print(f"Loading: {self.epub_path.name}")
-        self.chapters = extract_text_from_epub(str(epub_path))
-        print(f"Found {len(self.chapters)} chapters")
+        # Load document based on file type
+        print(f"Loading: {self.file_path.name}")
+        suffix = self.file_path.suffix.lower()
+        if suffix == '.pdf':
+            self.chapters = extract_text_from_pdf(str(file_path))
+        elif suffix == '.epub':
+            self.chapters = extract_text_from_epub(str(file_path))
+        else:
+            raise ValueError(f"Unsupported file format: {suffix}. Use .epub or .pdf")
+        print(f"Found {len(self.chapters)} articles/chapters")
 
         self.current_chapter = 0
         self.current_position = 0  # Character position in current chapter
@@ -216,7 +399,7 @@ class BookReader:
         return chunk
 
     def build_system_prompt(self) -> str:
-        return f"""You are reading the book "{self.epub_path.stem}" aloud to the user.
+        return f"""You are reading "{self.file_path.stem}" aloud to the user.
 
 AVAILABLE CHAPTERS:
 {self.get_chapter_list()}
@@ -630,8 +813,8 @@ def list_devices():
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Read epub books aloud with voice Q&A")
-    parser.add_argument("epub_file", nargs="?", help="Path to epub file")
+    parser = argparse.ArgumentParser(description="Read epub/pdf files aloud with voice Q&A")
+    parser.add_argument("file", nargs="?", help="Path to epub or pdf file")
     parser.add_argument("--voice", "-v", default="ash",
                         choices=["alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"],
                         help="Voice to use (default: ash)")
@@ -640,7 +823,7 @@ def main():
     parser.add_argument("--list-devices", "-l", action="store_true",
                         help="List available audio devices")
     parser.add_argument("--chapter", "-c", type=int, default=0,
-                        help="Start from chapter number (0-indexed)")
+                        help="Start from chapter/article number (0-indexed)")
 
     args = parser.parse_args()
 
@@ -648,15 +831,15 @@ def main():
         list_devices()
         sys.exit(0)
 
-    if not args.epub_file:
+    if not args.file:
         parser.print_help()
         sys.exit(1)
 
-    if not Path(args.epub_file).exists():
-        print(f"Error: File not found: {args.epub_file}")
+    if not Path(args.file).exists():
+        print(f"Error: File not found: {args.file}")
         sys.exit(1)
 
-    reader = BookReader(args.epub_file, args.voice, args.input, args.output)
+    reader = BookReader(args.file, args.voice, args.input, args.output)
     reader.current_chapter = args.chapter
     asyncio.run(reader.run())
 

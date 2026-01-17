@@ -2,3 +2,5 @@ websockets>=12.0
 pyaudio>=0.2.14
 ebooklib>=0.18
 beautifulsoup4>=4.12
+pymupdf>=1.24.0
+pymupdf4llm>=0.0.17
