@@ -145,17 +145,125 @@ def split_markdown_into_articles(md_text: str) -> list[dict]:
     return articles
 
 
+def detect_articles_with_gemini(full_text: str) -> list[str]:
+    """Use Gemini CLI to detect article titles from PDF text.
+
+    Samples multiple sections of the document for better coverage.
+    Returns list of article titles found in the text.
+    """
+    import subprocess
+    import shutil
+
+    # Check if gemini CLI is available
+    if not shutil.which('gemini'):
+        return []
+
+    # Sample from different parts of the document for better coverage
+    text_len = len(full_text)
+    samples = []
+
+    # Take samples from beginning, middle sections, and end
+    chunk_size = 10000
+    if text_len > chunk_size * 5:
+        # Long document: sample 5 sections
+        positions = [0, text_len // 4, text_len // 2, 3 * text_len // 4, text_len - chunk_size]
+        for pos in positions:
+            samples.append(full_text[pos:pos + chunk_size])
+        sample_text = '\n\n---\n\n'.join(samples)
+    else:
+        # Short document: use all of it
+        sample_text = full_text[:50000]
+
+    prompt = """Analyze this magazine/newspaper text and list ALL article titles you can find.
+Article titles are typically:
+- Short headlines (under 15 words) that introduce a story
+- Often clever, punny, or attention-grabbing
+- NOT section headers like "Business", "Politics", "United States"
+- NOT navigation text like "Share", "Save", "Listen to this story"
+
+Return ONLY the article titles, one per line. No numbering, no quotes, no explanations.
+
+Text samples from the document:
+""" + sample_text
+
+    try:
+        result = subprocess.run(
+            ['gemini', '-o', 'text', prompt],
+            capture_output=True,
+            text=True,
+            timeout=90
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            titles = [line.strip() for line in result.stdout.strip().split('\n')
+                     if line.strip() and len(line.strip()) > 5 and len(line.strip()) < 100]
+            # Deduplicate while preserving order
+            seen = set()
+            unique_titles = []
+            for t in titles:
+                t_lower = t.lower()
+                if t_lower not in seen:
+                    seen.add(t_lower)
+                    unique_titles.append(t)
+            return unique_titles
+    except Exception as e:
+        print(f"Gemini error: {e}")
+
+    return []
+
+
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     """Extract articles/sections from PDF file.
 
-    Handles multi-column layouts common in magazines.
-    Falls back to page-based extraction if markdown extraction fails.
+    Uses Gemini CLI for article detection if available.
+    Falls back to heuristic extraction otherwise.
     """
     import pymupdf
 
     doc = pymupdf.open(pdf_path)
 
-    # Try pymupdf4llm first for better layout handling
+    # Extract all text first
+    all_pages_text = []
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        text = page.get_text().strip()
+        if text:
+            all_pages_text.append((page_num, text))
+
+    full_text = '\n\n'.join(text for _, text in all_pages_text)
+
+    # Try Gemini-based article detection
+    print("Detecting articles with Gemini...")
+    article_titles = detect_articles_with_gemini(full_text)
+
+    if article_titles and len(article_titles) >= 3:
+        print(f"Gemini found {len(article_titles)} articles")
+        # Split text based on detected titles
+        articles = []
+        for title in article_titles:
+            # Find where this title appears in the text
+            title_lower = title.lower()
+            idx = full_text.lower().find(title_lower)
+            if idx != -1:
+                # Find the next title to determine end of this article
+                end_idx = len(full_text)
+                for next_title in article_titles:
+                    if next_title != title:
+                        next_idx = full_text.lower().find(next_title.lower(), idx + len(title))
+                        if next_idx != -1 and next_idx < end_idx:
+                            end_idx = next_idx
+
+                article_text = full_text[idx:end_idx].strip()
+                if len(article_text) > 200:
+                    articles.append({
+                        'title': title,
+                        'text': clean_pdf_text(article_text)
+                    })
+
+        if articles:
+            doc.close()
+            return articles
+
+    # Fallback: Try pymupdf4llm for better layout handling
     try:
         import pymupdf4llm
         md_text = pymupdf4llm.to_markdown(doc, show_progress=False)
