@@ -1,0 +1,381 @@
+#!/usr/bin/env python3.11
+"""
+clauded - CLI control tool for the Claude Code Daemon
+
+Usage:
+    clauded start              Start daemon in background
+    clauded stop               Graceful shutdown
+    clauded status             Check if running + session info
+    clauded reset              Clear conversation memory
+    clauded query "prompt"     Send query, stream response to stdout
+    clauded interactive        REPL mode (like claude CLI but persistent)
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+# Socket and PID paths
+SOCKET_PATH = os.environ.get('CLAUDE_DAEMON_SOCK', '/tmp/claude_daemon.sock')
+PID_FILE = os.environ.get('CLAUDE_DAEMON_PID', '/tmp/claude_daemon.pid')
+
+
+def get_daemon_pid() -> int | None:
+    """Get the PID of the running daemon, or None if not running."""
+    pid_path = Path(PID_FILE)
+    if not pid_path.exists():
+        return None
+
+    try:
+        pid = int(pid_path.read_text().strip())
+        # Check if process is actually running
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        # Process doesn't exist, clean up stale PID file
+        pid_path.unlink(missing_ok=True)
+        return None
+
+
+def is_daemon_running() -> bool:
+    """Check if the daemon is running."""
+    return get_daemon_pid() is not None and Path(SOCKET_PATH).exists()
+
+
+async def send_message(msg: dict) -> list[dict]:
+    """Send a message to the daemon and collect all responses."""
+    responses = []
+
+    try:
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+
+        # Send message
+        writer.write((json.dumps(msg) + '\n').encode())
+        await writer.drain()
+
+        # Read responses until done or error
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+
+            try:
+                response = json.loads(line.decode().strip())
+                responses.append(response)
+
+                # Stop on terminal messages
+                if response.get('type') in ('done', 'error', 'busy', 'status'):
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        writer.close()
+        await writer.wait_closed()
+
+    except FileNotFoundError:
+        return [{"type": "error", "message": "Daemon not running. Start with: clauded start"}]
+    except ConnectionRefusedError:
+        return [{"type": "error", "message": "Connection refused. Daemon may have crashed."}]
+    except Exception as e:
+        return [{"type": "error", "message": f"Connection error: {e}"}]
+
+    return responses
+
+
+async def stream_query(prompt: str):
+    """Send a query and stream responses to stdout."""
+    try:
+        reader, writer = await asyncio.open_unix_connection(SOCKET_PATH)
+
+        # Send query
+        msg = {"type": "query", "prompt": prompt}
+        writer.write((json.dumps(msg) + '\n').encode())
+        await writer.drain()
+
+        # Stream responses
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+
+            try:
+                response = json.loads(line.decode().strip())
+                resp_type = response.get('type', '')
+
+                if resp_type == 'text':
+                    print(response.get('content', ''), end='', flush=True)
+
+                elif resp_type == 'tool_use':
+                    tool = response.get('tool', '')
+                    inp = response.get('input', {})
+                    print(f"\n[Tool: {tool}]", file=sys.stderr, flush=True)
+
+                elif resp_type == 'tool_result':
+                    tool = response.get('tool', '')
+                    success = response.get('success', False)
+                    status = '✓' if success else '✗'
+                    print(f"[{status}]", file=sys.stderr, flush=True)
+
+                elif resp_type == 'done':
+                    cost = response.get('cost_usd', 0)
+                    if cost > 0:
+                        print(f"\n[Cost: ${cost:.4f}]", file=sys.stderr, flush=True)
+                    print()  # Final newline
+                    break
+
+                elif resp_type == 'error':
+                    print(f"\nError: {response.get('message', 'Unknown error')}", file=sys.stderr)
+                    break
+
+                elif resp_type == 'busy':
+                    print("Daemon is busy with another query. Please wait.", file=sys.stderr)
+                    break
+
+            except json.JSONDecodeError:
+                continue
+
+        writer.close()
+        await writer.wait_closed()
+
+    except FileNotFoundError:
+        print("Error: Daemon not running. Start with: clauded start", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_start(args):
+    """Start the daemon in background."""
+    if is_daemon_running():
+        print("Daemon is already running")
+        return 0
+
+    # Find the daemon script
+    daemon_script = Path(__file__).parent / 'claude_daemon.py'
+    if not daemon_script.exists():
+        print(f"Error: Cannot find {daemon_script}", file=sys.stderr)
+        return 1
+
+    # Start daemon in background
+    try:
+        # Use nohup + disown pattern for proper daemonization
+        cmd = f'nohup python3.11 {daemon_script} > /tmp/claude_daemon.log 2>&1 &'
+        subprocess.Popen(cmd, shell=True, start_new_session=True)
+
+        # Wait for socket to appear
+        import time
+        for _ in range(30):  # Wait up to 3 seconds
+            time.sleep(0.1)
+            if Path(SOCKET_PATH).exists():
+                print(f"Daemon started (socket: {SOCKET_PATH})")
+                return 0
+
+        print("Warning: Daemon started but socket not yet available", file=sys.stderr)
+        print("Check /tmp/claude_daemon.log for errors", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        print(f"Error starting daemon: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_stop(args):
+    """Stop the daemon."""
+    if not is_daemon_running():
+        print("Daemon is not running")
+        return 0
+
+    # Send shutdown command
+    responses = asyncio.run(send_message({"type": "shutdown"}))
+
+    for resp in responses:
+        if resp.get('type') == 'done':
+            print("Daemon stopped")
+            return 0
+        elif resp.get('type') == 'error':
+            print(f"Error: {resp.get('message')}", file=sys.stderr)
+
+    # Fallback: send SIGTERM
+    pid = get_daemon_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print("Sent SIGTERM to daemon")
+        except ProcessLookupError:
+            pass
+
+    return 0
+
+
+def cmd_status(args):
+    """Check daemon status."""
+    if not is_daemon_running():
+        print("Daemon is not running")
+        return 1
+
+    responses = asyncio.run(send_message({"type": "status"}))
+
+    for resp in responses:
+        if resp.get('type') == 'status':
+            state = resp.get('state', 'unknown')
+            queries = resp.get('queries', 0)
+            cost = resp.get('session_cost_usd', 0)
+            uptime = resp.get('uptime_seconds', 0)
+
+            # Format uptime
+            hours, remainder = divmod(int(uptime), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+            print(f"Status: {state}")
+            print(f"Queries: {queries}")
+            print(f"Session cost: ${cost:.4f}")
+            print(f"Uptime: {uptime_str}")
+            print(f"Socket: {SOCKET_PATH}")
+            return 0
+        elif resp.get('type') == 'error':
+            print(f"Error: {resp.get('message')}", file=sys.stderr)
+            return 1
+
+    return 1
+
+
+def cmd_reset(args):
+    """Reset conversation memory."""
+    if not is_daemon_running():
+        print("Daemon is not running. Start with: clauded start", file=sys.stderr)
+        return 1
+
+    responses = asyncio.run(send_message({"type": "reset"}))
+
+    for resp in responses:
+        if resp.get('type') == 'done':
+            print("Session reset - conversation memory cleared")
+            return 0
+        elif resp.get('type') == 'error':
+            print(f"Error: {resp.get('message')}", file=sys.stderr)
+            return 1
+
+    return 1
+
+
+def cmd_query(args):
+    """Send a query to the daemon."""
+    if not is_daemon_running():
+        print("Daemon is not running. Start with: clauded start", file=sys.stderr)
+        return 1
+
+    prompt = ' '.join(args.prompt)
+    if not prompt:
+        print("Error: No prompt provided", file=sys.stderr)
+        return 1
+
+    asyncio.run(stream_query(prompt))
+    return 0
+
+
+def cmd_interactive(args):
+    """Interactive REPL mode."""
+    if not is_daemon_running():
+        print("Daemon is not running. Start with: clauded start", file=sys.stderr)
+        return 1
+
+    print("Claude Daemon Interactive Mode")
+    print("Type 'quit' or 'exit' to leave, 'reset' to clear memory")
+    print("-" * 40)
+
+    while True:
+        try:
+            prompt = input("\n> ").strip()
+
+            if not prompt:
+                continue
+
+            if prompt.lower() in ('quit', 'exit'):
+                print("Goodbye!")
+                break
+
+            if prompt.lower() == 'reset':
+                responses = asyncio.run(send_message({"type": "reset"}))
+                for resp in responses:
+                    if resp.get('type') == 'done':
+                        print("Session reset")
+                    elif resp.get('type') == 'error':
+                        print(f"Error: {resp.get('message')}")
+                continue
+
+            if prompt.lower() == 'status':
+                cmd_status(args)
+                continue
+
+            print()  # Blank line before response
+            asyncio.run(stream_query(prompt))
+
+        except KeyboardInterrupt:
+            print("\nUse 'quit' to exit")
+        except EOFError:
+            print("\nGoodbye!")
+            break
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Control the Claude Code Daemon',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    clauded start              Start the daemon
+    clauded query "Hello"      Send a simple query
+    clauded query "Fix bug in main.py"  Send a coding task
+    clauded interactive        Enter REPL mode
+    clauded reset              Clear conversation memory
+    clauded stop               Stop the daemon
+"""
+    )
+
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # start
+    p_start = subparsers.add_parser('start', help='Start daemon in background')
+    p_start.set_defaults(func=cmd_start)
+
+    # stop
+    p_stop = subparsers.add_parser('stop', help='Stop the daemon')
+    p_stop.set_defaults(func=cmd_stop)
+
+    # status
+    p_status = subparsers.add_parser('status', help='Check daemon status')
+    p_status.set_defaults(func=cmd_status)
+
+    # reset
+    p_reset = subparsers.add_parser('reset', help='Clear conversation memory')
+    p_reset.set_defaults(func=cmd_reset)
+
+    # query
+    p_query = subparsers.add_parser('query', help='Send a query')
+    p_query.add_argument('prompt', nargs='+', help='The prompt to send')
+    p_query.set_defaults(func=cmd_query)
+
+    # interactive
+    p_interactive = subparsers.add_parser('interactive', help='Interactive REPL mode')
+    p_interactive.set_defaults(func=cmd_interactive)
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
