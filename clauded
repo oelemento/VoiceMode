@@ -164,9 +164,15 @@ def cmd_start(args):
 
     # Start daemon in background
     try:
-        # Use nohup + disown pattern for proper daemonization
-        cmd = f'nohup python3.11 {daemon_script} > /tmp/claude_daemon.log 2>&1 &'
-        subprocess.Popen(cmd, shell=True, start_new_session=True)
+        # Start daemon directly without shell, passing environment
+        log_file = open('/tmp/claude_daemon.log', 'w')
+        subprocess.Popen(
+            ['python3.11', str(daemon_script)],
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+            env=os.environ.copy(),  # Pass environment including ANTHROPIC_API_KEY
+        )
 
         # Wait for socket to appear
         import time

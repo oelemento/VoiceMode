@@ -71,6 +71,18 @@ class ClaudeDaemon:
         self.request_queue: asyncio.Queue = asyncio.Queue()
         self.sdk_task: Optional[asyncio.Task] = None
 
+    def load_claude_md(self) -> str:
+        """Load CLAUDE.md from current directory if it exists."""
+        claude_md_path = Path.cwd() / "CLAUDE.md"
+        if claude_md_path.exists():
+            try:
+                content = claude_md_path.read_text()
+                logger.info(f"Loaded CLAUDE.md ({len(content)} bytes)")
+                return content
+            except Exception as e:
+                logger.warning(f"Failed to read CLAUDE.md: {e}")
+        return ""
+
     async def sdk_worker(self):
         """
         Worker task that handles all SDK operations.
@@ -83,10 +95,33 @@ class ClaudeDaemon:
             ToolResultBlock, ResultMessage, UserMessage
         )
 
+        # Build system prompt with CLAUDE.md if present
+        base_prompt = """You are Jarvis, a voice assistant running as a persistent daemon. You have full access to the filesystem and can execute commands.
+
+## Response Style
+**Be extremely concise.** The user is listening, not reading.
+- Give short, direct answers (1-3 sentences when possible)
+- Prioritize the most important information first
+- Skip explanations unless asked
+- No preambles like "Sure, I can help with that"
+- No lists longer than 3-4 items unless specifically requested
+- When summarizing schedules/tasks, mention only the key items
+
+## User Context
+- Name: Olivier Elemento
+- Obsidian vault: /Users/ole2001/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/
+- Weekly notes: 10 Weekly/YYYY-Wnn.md (e.g., 2026-W04.md for week 4)
+"""
+        claude_md = self.load_claude_md()
+        if claude_md:
+            system_prompt = f"{base_prompt}\n\n# Project Instructions (CLAUDE.md)\n\n{claude_md}"
+        else:
+            system_prompt = base_prompt
+
         options = ClaudeAgentOptions(
             allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task", "WebFetch", "WebSearch"],
             permission_mode="bypassPermissions",
-            system_prompt="You are Claude, running as a persistent daemon. You have full access to the filesystem and can execute commands. Be helpful and efficient.",
+            system_prompt=system_prompt,
             cwd=Path.cwd(),
         )
 
@@ -122,6 +157,7 @@ class ClaudeDaemon:
                         elif isinstance(request, QueryRequest):
                             self.is_busy = True
                             self.query_count += 1
+                            used_tools = False  # Track if tools were used
 
                             try:
                                 await client.query(request.prompt)
@@ -135,6 +171,7 @@ class ClaudeDaemon:
                                                     "content": block.text
                                                 })
                                             elif isinstance(block, ToolUseBlock):
+                                                used_tools = True
                                                 await request.response_callback({
                                                     "type": "tool_use",
                                                     "tool": block.name,
@@ -161,13 +198,25 @@ class ClaudeDaemon:
                                         break
 
                             except Exception as e:
-                                logger.error(f"Query error: {e}")
-                                import traceback
-                                traceback.print_exc()
-                                await request.response_callback({
-                                    "type": "error",
-                                    "message": str(e)
-                                })
+                                error_msg = str(e)
+                                logger.error(f"Query error: {error_msg}")
+
+                                # Check for tool_use ID collision - needs session reset
+                                if "tool_use" in error_msg and "unique" in error_msg:
+                                    logger.warning("Tool use ID collision detected, resetting session...")
+                                    await request.response_callback({
+                                        "type": "error",
+                                        "message": "Session reset due to tool conflict. Please retry your query."
+                                    })
+                                    self.is_busy = False
+                                    break  # Break inner loop to start fresh SDK session
+                                else:
+                                    import traceback
+                                    traceback.print_exc()
+                                    await request.response_callback({
+                                        "type": "error",
+                                        "message": error_msg
+                                    })
                             finally:
                                 self.is_busy = False
 
