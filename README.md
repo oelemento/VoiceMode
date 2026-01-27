@@ -381,3 +381,112 @@ python3.11 jarvis_daemon.py --list-devices
 | Tool access | Yes | Yes |
 | Permission prompts | Voice approval | Bypassed (daemon mode) |
 | Hands-free mode | Yes | No (push-to-talk only) |
+
+---
+
+# Jarvis Wake Word
+
+Wake word activated voice assistant - say "Jarvis" to start, like Siri or Alexa.
+
+## Requirements
+
+```bash
+pip install pvporcupine
+brew install python-tk@3.11  # For status window (macOS)
+export PICOVOICE_ACCESS_KEY="your-key-here"  # Get from picovoice.ai
+```
+
+## Usage
+
+```bash
+# First, start the daemon
+./clauded start
+
+# Then start wake word Jarvis
+python3.11 jarvis_wakeword.py [options]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--voice`, `-v` | TTS voice: alloy, echo, fable, onyx, nova, shimmer (default: onyx) |
+| `--input`, `-i` | Input device index (microphone) |
+| `--output`, `-o` | Output device index (speakers/headphones) |
+| `--list-devices`, `-l` | List available audio devices |
+| `--no-airpods` | Skip AirPods auto-detection |
+| `--no-status` | Disable floating status window |
+
+### Status Window
+
+A floating status window shows current state in the top-right corner:
+
+| Color | State | Description |
+|-------|-------|-------------|
+| Red | Daemon Off | Claude daemon not running |
+| Gray | Idle | Listening for "Jarvis" wake word |
+| Yellow | Activated | Wake word detected, chime playing |
+| Green | Recording | User is speaking |
+| Blue | Processing | Waiting for Claude response |
+| Purple | Speaking | TTS playing response |
+
+Disable with `--no-status` if the window causes issues.
+
+### How It Works
+
+1. **Porcupine** listens locally for "Jarvis" wake word (no API calls)
+2. On detection, plays a chime and starts recording
+3. **Auto-calibration** measures ambient noise to set silence threshold
+4. **Silence detection** ends recording after 1.5s of quiet (min 2s recording)
+5. **OpenAI Whisper** transcribes speech
+6. **Claude Daemon** processes query (with "be concise" instruction)
+7. **OpenAI TTS** speaks the response
+
+### Auto-Detection
+
+Automatically selects the best microphone:
+1. AirPods (if connected)
+2. TONOR USB mic
+3. MacBook built-in
+
+### Silence Detection
+
+The system auto-calibrates on startup:
+- Measures 1 second of ambient noise
+- Sets threshold = avg_noise × 1.7
+- Speech must exceed threshold × 1.5 to register
+- Recording ends after 1.5s of silence (minimum 2s total)
+
+After wake word detection:
+- 0.3s pause to let chime finish
+- Audio buffer flushed to clear wake word
+- Fresh recording starts
+
+### Testing Audio Levels
+
+```bash
+# Test your microphone levels
+python3.11 test_audio_levels.py -d 2 -t 10
+
+# List devices first
+python3.11 test_audio_levels.py -l
+```
+
+### Exit Phrases
+
+Say any of these to stop:
+- "goodbye"
+- "shutdown" / "shut down"
+- "exit" / "quit"
+- "stop listening"
+
+### Comparison: Push-to-talk vs Wake Word
+
+| Feature | jarvis_daemon.py | jarvis_wakeword.py |
+|---------|------------------|---------------------|
+| Activation | SPACE key | Say "Jarvis" |
+| End recording | SPACE key | Automatic (silence) |
+| Status window | No | Yes (floating indicator) |
+| API usage | OpenAI only | OpenAI + Porcupine (local) |
+| Dependencies | Standard | + pvporcupine, tkinter |
+| Best for | Noisy environments | Hands-free use |

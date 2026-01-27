@@ -29,6 +29,17 @@ from claude_client import (
     DoneMessage,
     ErrorMessage,
 )
+from jarvis_status import JarvisStatusWindow
+
+
+class NoOpStatus:
+    """No-op status window for when --no-status is used."""
+    def start(self):
+        pass
+    def set_state(self, state: str):
+        pass
+    def close(self):
+        pass
 
 # Audio settings
 SAMPLE_RATE = 16000  # Porcupine requires 16kHz
@@ -147,16 +158,21 @@ class JarvisWakeWord:
         # Claude daemon
         self.claude = None
 
+        # Status window
+        self.status = JarvisStatusWindow()
+
     async def connect_daemon(self):
         """Connect to Claude Daemon."""
         try:
             self.claude = ClaudeDaemon()
-            status = await self.claude.status()
-            print(f"Connected to daemon (queries: {status.queries})")
+            daemon_status = await self.claude.status()
+            print(f"Connected to daemon (queries: {daemon_status.queries})")
+            self.status.set_state("idle")
             return True
         except DaemonNotRunningError as e:
             print(f"\033[91mError: {e}\033[0m")
             print("\033[93mStart with: ./clauded start\033[0m")
+            self.status.set_state("off")
             return False
 
     def init_porcupine(self):
@@ -232,6 +248,7 @@ class JarvisWakeWord:
 
     async def record_until_silence(self):
         """Record audio until silence detected. Returns audio bytes."""
+        self.status.set_state("recording")
         print("\033[92m[Listening...]\033[0m", end="", flush=True)
 
         frames = []
@@ -251,10 +268,17 @@ class JarvisWakeWord:
             threshold = getattr(self, 'silence_threshold', SILENCE_THRESHOLD)
 
             # Must detect speech before we start looking for silence
-            if level > threshold * 1.2:
+            # Require minimum 2 seconds before even checking for silence
+            elapsed = time.time() - recording_start
+
+            # Debug: show levels periodically
+            if int(elapsed * 10) % 5 == 0 and len(frames) % 10 == 0:
+                print(f" [{level}]", end="", flush=True)
+
+            if level > threshold * 1.5:  # More aggressive speech detection
                 speech_detected = True
                 silence_start = None
-            elif speech_detected and level < threshold:
+            elif speech_detected and level < threshold and elapsed > 2.0:
                 if silence_start is None:
                     silence_start = time.time()
                 elif time.time() - silence_start > SILENCE_DURATION:
@@ -344,11 +368,15 @@ class JarvisWakeWord:
 
     async def query_claude(self, prompt: str):
         """Send query to Claude and speak response."""
+        self.status.set_state("processing")
         try:
             print(f"\033[94mClaude:\033[0m ", end="", flush=True)
             full_response = []
 
-            async for msg in self.claude.query(prompt):
+            # Add instruction for brief voice responses
+            voice_prompt = f"[Voice assistant mode - respond in 1-2 sentences max, be concise] {prompt}"
+
+            async for msg in self.claude.query(voice_prompt):
                 if isinstance(msg, TextMessage):
                     print(msg.content, end="", flush=True)
                     full_response.append(msg.content)
@@ -385,6 +413,7 @@ class JarvisWakeWord:
         if not text.strip():
             return
 
+        self.status.set_state("speaking")
         try:
             response = self.openai_client.audio.speech.create(
                 model="tts-1",
@@ -403,6 +432,10 @@ class JarvisWakeWord:
 
     async def run(self):
         """Main run loop."""
+        # Start status window
+        self.status.start()
+        self.status.set_state("off")
+
         try:
             # Connect to daemon
             if not await self.connect_daemon():
@@ -450,7 +483,18 @@ class JarvisWakeWord:
 
                 if keyword_index >= 0:
                     print("\n\033[96m[Jarvis activated]\033[0m")
+                    self.status.set_state("activated")
                     self.play_chime()
+
+                    # Brief pause to let wake word audio clear
+                    await asyncio.sleep(0.3)
+
+                    # Flush any buffered audio
+                    try:
+                        while self.input_stream.get_read_available() > 0:
+                            self.input_stream.read(self.porcupine.frame_length, exception_on_overflow=False)
+                    except:
+                        pass
 
                     # Record until silence
                     audio_data = await self.record_until_silence()
@@ -473,6 +517,7 @@ class JarvisWakeWord:
                     else:
                         print("\033[90m[No speech detected]\033[0m")
 
+                    self.status.set_state("idle")
                     print("\n\033[90m[Listening for 'Jarvis'...]\033[0m")
 
                 await asyncio.sleep(0)  # Yield to event loop
@@ -485,6 +530,8 @@ class JarvisWakeWord:
     async def cleanup(self):
         """Clean up resources."""
         self.running = False
+        if self.status:
+            self.status.close()
         if self.input_stream:
             self.input_stream.stop_stream()
             self.input_stream.close()
@@ -524,6 +571,7 @@ def main():
     parser.add_argument("--output", "-o", type=int, help="Output device index")
     parser.add_argument("--list-devices", "-l", action="store_true")
     parser.add_argument("--no-airpods", action="store_true")
+    parser.add_argument("--no-status", action="store_true", help="Disable status window")
 
     args = parser.parse_args()
 
@@ -541,6 +589,10 @@ def main():
             print(f"\033[96m🎤 Using: {device_name}\033[0m")
 
     jarvis = JarvisWakeWord(args.voice, input_device, output_device)
+
+    if args.no_status:
+        jarvis.status = NoOpStatus()
+
     asyncio.run(jarvis.run())
 
 
